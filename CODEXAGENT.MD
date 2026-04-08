@@ -13,6 +13,23 @@ Agents should make scoped, verifiable changes that match the existing architectu
 - For research tasks, prefer analysis and documentation over implementation unless coding is explicitly requested.
 - When working in a dirty worktree, preserve unrelated user changes.
 
+## Workflow
+Read these before starting:
+- docs/current_findings.md
+- docs/debug_log.md for debug tasks
+- docs/eval_log.md for eval tasks
+
+Maintain these files during work:
+- docs/debug_log.md: append-only investigation history
+- docs/eval_log.md: append-only evaluation history
+- docs/current_findings.md: short confirmed facts only
+
+Rules:
+- Do not rewrite or delete prior log entries; append updates.
+- Update current_findings.md only for confirmed facts, fixes, or important remaining risks.
+- Do not put speculation in current_findings.md.
+- During eval, do not modify code unless a new correctness issue is found.
+
 ## Code standards
 - Follow existing naming, structure, and style in the repository.
 - Prefer simple, readable code over clever code.
