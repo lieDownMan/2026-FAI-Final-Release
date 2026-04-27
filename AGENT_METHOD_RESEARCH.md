@@ -67,6 +67,234 @@ This file is research/planning only. It does not contain implementation code.
 | Rank-aware objective shaping | Optimize expected rank or probability of not finishing last instead of raw bullheads. | Aligns with grading tournament rank; can choose different risk levels when leading/trailing. | Rank requires opponent score modeling; can choose locally odd moves. | Medium-high. | High as an evaluator feature. |
 | Adversarial/counter-baseline tuning | Train or tune specifically against released baselines and adversarial synthetic styles, while holding out seeds/opponents. | Practical for class tournament; improves robustness if validation is honest. | Overfitting risk; released baselines are only a subset and cannot be imported directly. | Medium. | High. |
 
+## Human-Strategy-Derived Rule-Based Variants
+
+The two human-strategy sources point to three broad families that are realistic under the assignment constraints:
+
+- low-first play order
+- high-first / blocker play order
+- board-aware "play close to the table" behavior
+
+The important adaptation is that the paper assumes standard 6 Nimmt low-card choice, while this assignment engine forces the lowest-penalty row on low cards. So these methods should not blindly copy human play; they should convert "take a cheap row on purpose" into an explicit deterministic-row calculation.
+
+### Shared State Features For Any Rule-Based Player
+
+Every variant below can reuse the same cheap features per candidate card:
+
+- `target_row_idx`, `target_row_end`: the closest lower row end, or `-1` if the card is below every row.
+- `row_score`: bullheads currently sitting in the target row.
+- `row_len`: current number of cards in the target row.
+- `gap`: `card - target_row_end` when the card fits somewhere.
+- `open_slots_before_take`: `board_size_x - row_len`. In this engine, `0` means the next card takes the row.
+- `intervening_count`: unseen cards strictly between `target_row_end` and `card`. This is a cheap proxy for "how many lower opponent cards can arrive before my card resolves."
+- `low_reset_cost`: if `target_row_idx == -1`, the exact penalty of the deterministic row the engine would make us take.
+- `played_card_score`: bullheads on the card itself. This matters for dump logic because once the card is on the table, someone else may later take it.
+- `dangerous_row`: true if the row contains `55`, any multiple of `11`, or total row bullheads above a threshold such as `>= 5`.
+- `hand_rank_pct`: percentile rank of the card inside our sorted hand.
+- `run_middle_flag`: true when the card is part of a local run and has nearby hand neighbors on both sides.
+- `outlier_flag`: true when the card is isolated far from the rest of our hand.
+- `score_pressure`: normalized measure of whether we are leading, tied, or trailing on current bullheads.
+
+These are all compatible with the current player API and match the existing helper style already used by [src/players/cfr/full_cfr_player.py](/home/thoamslai/projects/myproject/2026-FAI-Final-Release/src/players/cfr/full_cfr_player.py) and [src/players/alpha_zero_lite/alpha_zero_lite_player.py](/home/thoamslai/projects/myproject/2026-FAI-Final-Release/src/players/alpha_zero_lite/alpha_zero_lite_player.py).
+
+### Variant 1: Low-First Safe-Shed
+
+Source inspiration:
+
+- `strategy.txt`: get rid of small cards early; middle cards in runs are often safer.
+- Ayala et al.: low-first players produced the best aggregate result in their small study.
+
+How it should work:
+
+1. Split the hand into early-, mid-, and late-game behavior by `len(hand)`.
+2. In early game, heavily bias toward the lowest 30-40% of cards in hand, but only after a safety filter.
+3. A card is "safe enough" if either:
+   - it fits a row with `row_len <= 3` and `intervening_count < open_slots_before_take`, or
+   - it is a low reset whose `low_reset_cost` is below a small threshold such as `<= 3`.
+4. Among safe-enough cards, choose the smallest card, except:
+   - prefer a `run_middle_flag` card over the absolute minimum if both are similarly safe, because that preserves flexibility on both sides of the run;
+   - if two choices have similar safety, dump the one with larger `played_card_score`.
+5. In late game, reduce the low-first bias and switch to pure minimum-risk selection, because forced low resets become more dangerous when only a few cards remain.
+
+What makes it distinct:
+
+- It is not "always play the smallest card." It is "shed low cards early only when the engine-specific reset cost and sixth-card risk are acceptable."
+
+Likely strengths:
+
+- Very fast.
+- Directly grounded in the best-performing human archetype from the paper.
+- Good baseline and fallback policy.
+
+Likely weaknesses:
+
+- Can become too passive when a slightly larger card would create a much safer board for the next two rounds.
+
+### Variant 2: Closest-Fit Conservative
+
+Source inspiration:
+
+- Ayala et al.: the table-aware group tried to play close to current rows and often preferred shorter rows.
+- `strategy.txt`: "safely nestle your cards into the middle of existing rows."
+
+How it should work:
+
+1. For each legal card, compute a board-fit score such as:
+   `fit_score = gap + 4 * max(row_len - 2, 0) + 3 * intervening_count + 2 * row_score`
+2. Reject or heavily penalize cards whose target row already has `row_len == 5`, unless they intentionally take a very cheap row.
+3. Add a bonus when the target row has `row_len <= 2`, following the paper's "prefer short columns" idea.
+4. Add a penalty when `dangerous_row` is true, especially for rows containing `55` or red cards.
+5. If no fitting card looks acceptable, compare:
+   - cheapest deterministic low reset
+   - least-bad risky fit
+   and take whichever has lower worst-case penalty.
+
+What makes it distinct:
+
+- This model cares more about local board geometry than play-order bias.
+
+Likely strengths:
+
+- Simple, interpretable, and directly tied to visible table structure.
+- Strong candidate against random and weak heuristic opponents.
+
+Likely weaknesses:
+
+- Can be shortsighted about hand shape and future forced resets.
+
+### Variant 3: High-First Blocker
+
+Source inspiration:
+
+- Ayala et al.: a smaller group played high cards early and low cards late with moderate success.
+- `strategy.txt`: in the normal variant, use high cards early to close dangerous rows before getting trapped later.
+
+How it should work:
+
+1. In rounds 1-4, bias toward the top 30-40% of cards in hand.
+2. Prefer high cards that do one of the following:
+   - land safely on a high-bullhead row without taking it,
+   - replace an outlier high card that will be awkward later,
+   - create a board endpoint that makes opponents' low-mid cards harder to place.
+3. Keep one or two low cards in reserve as emergency cheap resets, but do not preserve them if the current cheapest reset row is already expensive.
+4. If several high cards are similarly risky, dump the one with the largest `played_card_score` first.
+5. After the hand shrinks to about 5 cards, switch to a neutral risk scorer so the player does not blindly cling to the high-first plan.
+
+What makes it distinct:
+
+- It deliberately trades away early hand smoothness to avoid late-game row takes and to create more awkward board states for others.
+
+Likely strengths:
+
+- Different failure profile from low-first, which is useful if we eventually want two meaningfully different submission players.
+
+Likely weaknesses:
+
+- More volatile, and likely weaker than low-first unless the blocker rules are tuned carefully.
+
+### Variant 4: Controlled Reset Sacrifice
+
+Source inspiration:
+
+- `strategy.txt`: taking a small penalty early can be better than taking a disaster later.
+- The assignment engine's deterministic low-card rule makes cheap sacrifices exactly computable.
+
+How it should work:
+
+1. For every candidate card, simulate the immediate board after placement.
+2. Mark a card as an intentional-sacrifice candidate if it either:
+   - takes a deterministic low reset with `low_reset_cost <= cheap_reset_threshold`, or
+   - takes a full row whose `row_score` is still cheap enough relative to current score pressure.
+3. Only accept that sacrifice if the resulting board improves our future hand structure. A cheap proxy is:
+   - count how many remaining hand cards become "safe enough" after the sacrifice;
+   - require this count to increase by at least `2`, or require one very dangerous future card to disappear.
+4. When leading, use a strict sacrifice threshold.
+5. When trailing, allow a slightly larger sacrifice threshold to create volatility and avoid slow death by repeated medium penalties.
+
+What makes it distinct:
+
+- This is the best way to exploit the repo's deterministic low-card rule in a purely rule-based player.
+
+Likely strengths:
+
+- Can turn a forced future disaster into a controlled small loss.
+- Strongly assignment-specific, which gives it novelty.
+
+Likely weaknesses:
+
+- Needs careful board-improvement heuristics or it may over-sacrifice.
+
+### Variant 5: Leader-Punish Rank-Aware Blocker
+
+Source inspiration:
+
+- Ayala et al. conclude that low-first plus targeting strong players worked best.
+- `strategy.txt` emphasizes score position, group psychology, and forcing disasters onto others.
+
+How it should work:
+
+1. Compute current rank pressure from `history["scores"]`.
+2. If we are leading or near the lead:
+   - play conservative safety-first rules;
+   - avoid volatile blocker moves unless they are nearly free.
+3. If we are trailing:
+   - reward moves that leave behind dangerous rows for the table, for example rows with:
+     - high row bullheads,
+     - `row_len == 4` or `row_len == 5`,
+     - awkward endpoints that split the visible board badly.
+4. Add a "leader-punish" bonus to moves that worsen the board while the current leader still has many cards left. This is not player-specific targeting by hidden hand; it is table-level pressure based on score position.
+5. Tie-break toward dumping high-bullhead cards into the board when we are behind, because increasing future pickup cost for others matters more than preserving our own clean rows.
+
+What makes it distinct:
+
+- Same raw board can receive different actions depending on tournament rank pressure.
+
+Likely strengths:
+
+- Better aligned with the course objective of average rank, not just expected bullheads.
+
+Likely weaknesses:
+
+- More aggressive behavior can backfire if the board-danger heuristic is not calibrated.
+
+### Variant 6: Human-Strategy Portfolio Switcher
+
+Source inspiration:
+
+- The sources do not present one single universal rule. They suggest phase-dependent play: low-first, table-aware fit, tactical sacrifices, and score-aware aggression.
+
+How it should work:
+
+1. Use `Low-First Safe-Shed` in rounds 1-3.
+2. Use `Closest-Fit Conservative` in rounds 4-6.
+3. Overlay `Controlled Reset Sacrifice` whenever a cheap board reset improves at least two future cards.
+4. Overlay `Leader-Punish Rank-Aware Blocker` only when trailing by a configured margin.
+5. Fall back to a simple minimum-risk tie-break if no specialized rule clearly dominates.
+
+What makes it distinct:
+
+- This is the most likely "best practical rule-based player" because it combines the strongest human themes without needing search or training.
+
+Likely strengths:
+
+- Highest ceiling among the rule-only methods.
+- Natural candidate for `BestPlayer1`.
+
+Likely weaknesses:
+
+- More moving parts, so debugging and ablation matter more.
+
+## Best Rule-Based Implementation Order
+
+If the next task is to implement rule-based agents only, the best order is:
+
+1. `Low-First Safe-Shed`
+2. `Closest-Fit Conservative`
+3. `Controlled Reset Sacrifice`
+4. `Human-Strategy Portfolio Switcher`
+5. `High-First Blocker` as an intentionally different second player
+6. `Leader-Punish Rank-Aware Blocker` after basic evaluation is working
+
 ## Recommended Research Direction For Later Coding
 
 1. Build a safe heuristic evaluator first. This becomes the fallback for every future method and helps avoid timeouts.
